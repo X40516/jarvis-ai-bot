@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS couple_memory (
     PRIMARY KEY (couple_id, key)
 );
 
+CREATE TABLE IF NOT EXISTS pair_requests (
+    requester_id INTEGER NOT NULL,
+    target_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (requester_id, target_id)
+);
+
 """
 
 
@@ -143,6 +150,33 @@ class Database:
         return await asyncio.to_thread(_run)
 
     # ---------- Couple pairing & memory ----------
+
+    async def create_pair_request(self, requester_id: int, target_id: int):
+        """/pair @username bosilganda so'rov yaratiladi — hali hech kim bog'lanmagan,
+        faqat tasdiqlash kutilmoqda."""
+        await asyncio.to_thread(
+            self._exec,
+            "INSERT OR REPLACE INTO pair_requests (requester_id, target_id, created_at) VALUES (?, ?, ?)",
+            (requester_id, target_id, time.time()),
+        )
+
+    async def consume_pair_request(self, requester_id: int, target_id: int) -> bool:
+        """Callback (✅/❌) bosilganda chaqiriladi. So'rov haqiqatan mavjud bo'lsagina
+        True qaytaradi va uni bazadan o'chiradi (bir marta ishlatiladi, replay'ga qarshi)."""
+        def _run():
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM pair_requests WHERE requester_id=? AND target_id=?",
+                    (requester_id, target_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                conn.execute(
+                    "DELETE FROM pair_requests WHERE requester_id=? AND target_id=?",
+                    (requester_id, target_id),
+                )
+                return True
+        return await asyncio.to_thread(_run)
 
     async def link_couple(self, user_a: int, user_b: int) -> str:
         couple_id = f"{min(user_a, user_b)}_{max(user_a, user_b)}"
