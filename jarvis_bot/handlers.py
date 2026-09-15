@@ -5,12 +5,11 @@ Foydalanuvchi -> Input Filter (blok tekshiruvi) -> Text Normalization -> 18+ Mod
     -> Safety Check -> JARVIS AI -> Output Filter -> Telegram
 """
 import logging
-import secrets
 import time
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from .config import config
 from .db import db
@@ -107,35 +106,129 @@ async def cmd_start(message: Message):
         "Salom! Men JARVIS AI'man ❤️\n"
         "Men juftliklar uchun yaratilganman — munosabatlar, romantika, muloqot, "
         "sovg'a g'oyalari va birgalikdagi mashg'ulotlar bo'yicha yordam beraman.\n\n"
-        "Juftlikka ulanish uchun: /pair\n"
+        "Juftlikka ulanish uchun: /pair @username\n"
         "Suhbatni boshlash uchun shunchaki yozing 💌"
     )
 
 
 @router.message(Command("pair"))
-async def cmd_pair(message: Message):
-    """Ikki foydalanuvchini bir-biriga bog'lash (Couple Memory uchun asos)."""
+async def cmd_pair(message: Message, bot):
+    """Ikki foydalanuvchini Telegram username orqali bog'lash so'rovini boshlaydi.
+
+    Foydalanish: /pair @sevgilim_username
+
+    Oqim:
+    1. Foydalanuvchi /pair @username yozadi.
+    2. Bot bazada shu username ro'yxatdan o'tganmi tekshiradi (ikkalasi ham botdan
+       kamida bir marta /start bilan foydalangan bo'lishi kerak).
+    3. Topilsa — hamkorga tasdiqlash so'rovi (✅/❌ tugmalar bilan) yuboriladi.
+       Hech kim boshqasini o'z roziligisiz "juftlik"ka ulay olmaydi.
+    4. Hamkor ✅ bossagina ikkala user_id bazada bog'lanadi.
+    """
     args = message.text.split(maxsplit=1)
     user_id = message.from_user.id
     await db.get_or_create_user(user_id, message.from_user.username,
                                  message.from_user.first_name, message.from_user.last_name)
 
-    if len(args) == 1:
-        code = secrets.token_hex(3)
-        await db.create_pending_pair(code, user_id)
+    if len(args) == 1 or not args[1].strip():
         await message.answer(
-            f"Juftlik kodingiz: `{code}`\n\n"
-            "Sevgilingizga shu kodni yuboring, u botga `/pair {code}` deb yozsin.",
+            "Juftlikka ulanish uchun sevgilingizning Telegram username'ini yuboring:\n\n"
+            "`/pair @username`\n\n"
+            "Eslatma: sevgilingiz botga kamida bir marta /start bosgan bo'lishi kerak. ❤️",
             parse_mode="Markdown",
         )
-    else:
-        code = args[1].strip()
-        partner_id = await db.consume_pending_pair(code)
-        if not partner_id or partner_id == user_id:
-            await message.answer("❌ Kod topilmadi yoki muddati o'tgan. Qaytadan urinib ko'ring.")
-            return
-        couple_id = await db.link_couple(user_id, partner_id)
-        await message.answer("✅ Juftlik muvaffaqiyatli bog'landi! Endi Couple Memory ishlaydi. ❤️")
+        return
+
+    target_username = args[1].strip()
+    if not target_username.startswith("@"):
+        await message.answer("❌ Iltimos, username'ni @ belgisi bilan yuboring, masalan: `/pair @sevgilim`",
+                              parse_mode="Markdown")
+        return
+
+    if target_username.lstrip("@").lower() == (message.from_user.username or "").lower():
+        await message.answer("❌ O'zingiz bilan juftlasha olmaysiz 😅")
+        return
+
+    partner = await db.get_user_by_username(target_username)
+    if not partner:
+        await message.answer(
+            f"❌ {target_username} topilmadi. U botga hali /start bosmagan bo'lishi mumkin — "
+            "avval sevgilingiz botni ishga tushirsin, keyin qaytadan urinib ko'ring."
+        )
+        return
+
+    # --- 2-qadam: so'rov yaratiladi (hali hech kim bog'lanmagan) ---
+    await db.create_pair_request(requester_id=user_id, target_id=partner.user_id)
+
+    # --- 3-qadam: hamkorga tasdiqlash so'rovi yuboriladi ---
+    requester_label = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Ha", callback_data=f"pair_accept:{user_id}"),
+        InlineKeyboardButton(text="❌ Yo'q", callback_data=f"pair_reject:{user_id}"),
+    ]])
+    try:
+        await bot.send_message(
+            partner.user_id,
+            f"💌 {requester_label} sizni juftlik sifatida qo'shmoqchi. Tasdiqlaysizmi?",
+            reply_markup=keyboard,
+        )
+        await message.answer(f"✅ So'rov {target_username}ga yuborildi. Tasdiqlashini kuting. ⏳")
+    except Exception:
+        logger.warning("Hamkorga (%s) pairing so'rovini yuborib bo'lmadi", partner.user_id)
+        await message.answer(
+            "❌ Sevgilingizga so'rov yuborib bo'lmadi (u botni bloklagan bo'lishi mumkin)."
+        )
+
+
+@router.callback_query(F.data.startswith("pair_accept:"))
+async def cb_pair_accept(callback: CallbackQuery, bot):
+    """4-qadam: hamkor ✅ bosganda — ikkala user_id bazada bog'lanadi."""
+    requester_id = int(callback.data.split(":", 1)[1])
+    target_id = callback.from_user.id
+
+    ok = await db.consume_pair_request(requester_id=requester_id, target_id=target_id)
+    if not ok:
+        await callback.answer("Bu so'rov muddati o'tgan yoki allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
+
+    await db.link_couple(requester_id, target_id)
+    await callback.message.edit_text("✅ Juftlik muvaffaqiyatli bog'landi! Endi Couple Memory ishlaydi. ❤️")
+    await callback.answer("Tasdiqlandi ✅")
+    try:
+        await bot.send_message(
+            requester_id,
+            f"✅ @{callback.from_user.username or callback.from_user.first_name} so'rovingizni tasdiqladi! "
+            "Endi juftlik sifatida bog'landingiz. ❤️",
+        )
+    except Exception:
+        logger.warning("So'rov yuboruvchiga (%s) tasdiqlash xabarini yuborib bo'lmadi", requester_id)
+
+
+@router.callback_query(F.data.startswith("pair_reject:"))
+async def cb_pair_reject(callback: CallbackQuery, bot):
+    requester_id = int(callback.data.split(":", 1)[1])
+    target_id = callback.from_user.id
+
+    ok = await db.consume_pair_request(requester_id=requester_id, target_id=target_id)
+    if not ok:
+        await callback.answer("Bu so'rov muddati o'tgan yoki allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
+
+    await callback.message.edit_text("❌ So'rov rad etildi.")
+    await callback.answer("Rad etildi")
+    try:
+        await bot.send_message(requester_id, "❌ Sevgilingiz juftlik so'rovini rad etdi.")
+    except Exception:
+        logger.warning("So'rov yuboruvchiga (%s) rad etish xabarini yuborib bo'lmadi", requester_id)
+
+
+def _get_partner_id(couple_id, user_id) -> int | None:
+    """couple_id formati 'min_max' (ikkala user_id), shundan hamkornikini ajratib oladi."""
+    if not couple_id:
+        return None
+    a, b = couple_id.split("_")
+    a, b = int(a), int(b)
+    return b if a == user_id else a
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -203,12 +296,16 @@ async def handle_photo(message: Message, bot):
     image_result = await moderate_image(file_bytes.read())
 
     if image_result.verdict == ModerationVerdict.SAFE:
-        if record.couple_id:
-            # TODO: hamkorning telegram user_id'sini couple yozuvidan topib forward qiling.
-            # Bu qism sizning couple modelingizga qarab handlers/pairing.py ichida to'ldiriladi.
-            await message.answer("✅ Rasm xavfsiz deb tasdiqlandi va sevgilingizga yuborildi. 📸❤️")
+        partner_id = _get_partner_id(record.couple_id, user_id)
+        if partner_id:
+            try:
+                await bot.send_photo(partner_id, photo.file_id, caption=message.caption)
+                await message.answer("✅ Rasm xavfsiz deb tasdiqlandi va sevgilingizga yuborildi. 📸❤️")
+            except Exception:
+                logger.warning("Hamkorga (%s) rasm yuborib bo'lmadi", partner_id)
+                await message.answer("✅ Rasm xavfsiz, lekin sevgilingizga yuborishda xatolik yuz berdi.")
         else:
-            await message.answer("✅ Rasm xavfsiz. (Hamkoringizga yuborish uchun avval /pair qiling.)")
+            await message.answer("✅ Rasm xavfsiz. (Hamkoringizga yuborish uchun avval /pair @username qiling.)")
         return
 
     if image_result.verdict == ModerationVerdict.UNCERTAIN:
