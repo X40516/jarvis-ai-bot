@@ -28,8 +28,8 @@ class Config:
     BLOCK_THRESHOLD: int = 2
     ADMIN_ALERT_THRESHOLD: int = 3
 
-    # Ma'lumotlar bazasi
-    DB_PATH: str = os.getenv("DB_PATH", "jarvis.db")
+    # Ma'lumotlar bazasi (Postgres — Railway'dagi doimiy xizmat)
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 
 config = Config()
