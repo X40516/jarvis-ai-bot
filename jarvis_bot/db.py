@@ -1,30 +1,33 @@
 """
-Ma'lumotlar bazasi qatlami (SQLite).
+Ma'lumotlar bazasi qatlami (PostgreSQL, asyncpg orqali).
+
+Railway'dagi doimiy Postgres xizmatiga ulanadi — shuning uchun qayta deploy yoki
+qayta ishga tushirishlarda ma'lumotlar (foydalanuvchilar, qoidabuzarliklar, juftliklar,
+Couple Memory) YO'QOLMAYDI, ilgarigi vaqtinchalik SQLite'dan farqli o'laroq.
 
 Bo'lim 6 va 18 (Maxfiylik) talablariga ko'ra faqat zarur minimal ma'lumot saqlanadi:
 user_id, username, first/last name, violation_count, oxirgi violation vaqti, block_until,
 va (agar foydalanuvchi ixtiyoriy yuborgan bo'lsa) phone_number.
 18+ kontentning o'zi HECH QACHON bazaga yozilmaydi.
 """
-import asyncio
-import sqlite3
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
+
+import asyncpg
 
 from .config import config
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
+    user_id BIGINT PRIMARY KEY,
     username TEXT,
     first_name TEXT,
     last_name TEXT,
-    phone_number TEXT,           -- faqat ixtiyoriy yuborilgan bo'lsa to'ldiriladi
+    phone_number TEXT,                 -- faqat ixtiyoriy yuborilgan bo'lsa to'ldiriladi
     violation_count INTEGER NOT NULL DEFAULT 0,
-    last_violation_at REAL,
-    block_until REAL,            -- unix timestamp; NULL yoki o'tmishda bo'lsa bloklanmagan
+    last_violation_at DOUBLE PRECISION,
+    block_until DOUBLE PRECISION,      -- unix timestamp; NULL yoki o'tmishda bo'lsa bloklanmagan
     couple_id TEXT
 );
 
@@ -36,12 +39,11 @@ CREATE TABLE IF NOT EXISTS couple_memory (
 );
 
 CREATE TABLE IF NOT EXISTS pair_requests (
-    requester_id INTEGER NOT NULL,
-    target_id INTEGER NOT NULL,
-    created_at REAL NOT NULL,
+    requester_id BIGINT NOT NULL,
+    target_id BIGINT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (requester_id, target_id)
 );
-
 """
 
 
@@ -69,64 +71,59 @@ class UserRecord:
 
 
 class Database:
-    """Har bir chaqiruv asyncio.to_thread orqali blokловчи sqlite3 ustida ishlaydi.
+    """asyncpg connection pool ustida ishlaydi. `init()` main.py ichida, polling
+    boshlanishidan oldin bir marta chaqiriladi."""
 
-    Kichik/o'rta yuklama uchun yetarli. Katta hajmda concurrent yozuv kerak bo'lsa,
-    buni Postgres + asyncpg ga almashtiring (interfeys shu ko'rinishda qoladi).
-    """
+    def __init__(self, dsn: str = None):
+        self.dsn = dsn or config.DATABASE_URL
+        self._pool: Optional[asyncpg.Pool] = None
 
-    def __init__(self, path: str = None):
-        self.path = path or config.DB_PATH
-        self._init_db()
+    async def init(self):
+        if not self.dsn:
+            raise RuntimeError("DATABASE_URL .env yoki Railway o'zgaruvchilarida topilmadi.")
+        self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10)
+        async with self._pool.acquire() as conn:
+            await conn.execute(_SCHEMA)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self):
-        with self._connect() as conn:
-            conn.executescript(_SCHEMA)
+    async def close(self):
+        if self._pool:
+            await self._pool.close()
 
     # ---------- Foydalanuvchi ----------
 
     async def get_or_create_user(self, user_id: int, username: str = None,
                                   first_name: str = None, last_name: str = None) -> UserRecord:
-        return await asyncio.to_thread(self._get_or_create_user_sync, user_id, username, first_name, last_name)
-
-    def _get_or_create_user_sync(self, user_id, username, first_name, last_name) -> UserRecord:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO users (user_id, username, first_name, last_name, violation_count) "
-                    "VALUES (?, ?, ?, ?, 0)",
-                    (user_id, username, first_name, last_name),
-                )
-                row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-            else:
-                # profil ma'lumotlarini yangilab boramiz (username o'zgargan bo'lishi mumkin)
-                conn.execute(
-                    "UPDATE users SET username=?, first_name=?, last_name=? WHERE user_id=?",
-                    (username, first_name, last_name, user_id),
-                )
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name, violation_count)
+                VALUES ($1, $2, $3, $4, 0)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET username=EXCLUDED.username,
+                        first_name=EXCLUDED.first_name,
+                        last_name=EXCLUDED.last_name
+                RETURNING *
+                """,
+                user_id, username, first_name, last_name,
+            )
             return self._row_to_record(row)
 
     async def set_phone_number(self, user_id: int, phone_number: str):
-        await asyncio.to_thread(self._exec, "UPDATE users SET phone_number=? WHERE user_id=?", (phone_number, user_id))
+        async with self._pool.acquire() as conn:
+            await conn.execute("UPDATE users SET phone_number=$1 WHERE user_id=$2", phone_number, user_id)
 
     async def get_user(self, user_id: int) -> Optional[UserRecord]:
-        row = await asyncio.to_thread(self._fetchone, "SELECT * FROM users WHERE user_id=?", (user_id,))
-        return self._row_to_record(row) if row else None
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+            return self._row_to_record(row) if row else None
 
     async def get_user_by_username(self, username: str) -> Optional[UserRecord]:
         """Telegram username orqali foydalanuvchini topadi (faqat botga avval /start
         bosgan foydalanuvchilar topiladi — Telegram Bot API boshqacha yo'l bermaydi)."""
         username = username.lstrip("@").lower()
-        row = await asyncio.to_thread(
-            self._fetchone, "SELECT * FROM users WHERE lower(username)=?", (username,)
-        )
-        return self._row_to_record(row) if row else None
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE lower(username)=$1", username)
+            return self._row_to_record(row) if row else None
 
     # ---------- Qoidabuzarlik / bloklash ----------
 
@@ -135,89 +132,66 @@ class Database:
 
         20 daqiqalik vaqtinchalik blok BLOCK_THRESHOLD (2-marta)da shu yerda qo'llanadi.
         """
-        def _run():
-            with self._connect() as conn:
-                conn.execute(
-                    "UPDATE users SET violation_count = violation_count + 1, last_violation_at=? WHERE user_id=?",
-                    (time.time(), user_id),
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                new_count = await conn.fetchval(
+                    "UPDATE users SET violation_count = violation_count + 1, last_violation_at=$1 "
+                    "WHERE user_id=$2 RETURNING violation_count",
+                    time.time(), user_id,
                 )
-                row = conn.execute("SELECT violation_count FROM users WHERE user_id=?", (user_id,)).fetchone()
-                new_count = row["violation_count"]
                 if new_count == config.BLOCK_THRESHOLD:
                     block_until = time.time() + config.TEMP_BLOCK_MINUTES * 60
-                    conn.execute("UPDATE users SET block_until=? WHERE user_id=?", (block_until, user_id))
+                    await conn.execute("UPDATE users SET block_until=$1 WHERE user_id=$2", block_until, user_id)
                 return new_count
-        return await asyncio.to_thread(_run)
 
     # ---------- Couple pairing & memory ----------
 
     async def create_pair_request(self, requester_id: int, target_id: int):
         """/pair @username bosilganda so'rov yaratiladi — hali hech kim bog'lanmagan,
         faqat tasdiqlash kutilmoqda."""
-        await asyncio.to_thread(
-            self._exec,
-            "INSERT OR REPLACE INTO pair_requests (requester_id, target_id, created_at) VALUES (?, ?, ?)",
-            (requester_id, target_id, time.time()),
-        )
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO pair_requests (requester_id, target_id, created_at) VALUES ($1, $2, $3)
+                ON CONFLICT (requester_id, target_id) DO UPDATE SET created_at=EXCLUDED.created_at
+                """,
+                requester_id, target_id, time.time(),
+            )
 
     async def consume_pair_request(self, requester_id: int, target_id: int) -> bool:
         """Callback (✅/❌) bosilganda chaqiriladi. So'rov haqiqatan mavjud bo'lsagina
         True qaytaradi va uni bazadan o'chiradi (bir marta ishlatiladi, replay'ga qarshi)."""
-        def _run():
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM pair_requests WHERE requester_id=? AND target_id=?",
-                    (requester_id, target_id),
-                ).fetchone()
-                if row is None:
-                    return False
-                conn.execute(
-                    "DELETE FROM pair_requests WHERE requester_id=? AND target_id=?",
-                    (requester_id, target_id),
-                )
-                return True
-        return await asyncio.to_thread(_run)
+        async with self._pool.acquire() as conn:
+            deleted = await conn.fetchval(
+                "DELETE FROM pair_requests WHERE requester_id=$1 AND target_id=$2 RETURNING 1",
+                requester_id, target_id,
+            )
+            return deleted is not None
 
     async def link_couple(self, user_a: int, user_b: int) -> str:
         couple_id = f"{min(user_a, user_b)}_{max(user_a, user_b)}"
-        await asyncio.to_thread(
-            self._exec_many,
-            "UPDATE users SET couple_id=? WHERE user_id=?",
-            [(couple_id, user_a), (couple_id, user_b)],
-        )
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("UPDATE users SET couple_id=$1 WHERE user_id=$2", couple_id, user_a)
+                await conn.execute("UPDATE users SET couple_id=$1 WHERE user_id=$2", couple_id, user_b)
         return couple_id
 
     async def save_couple_memory(self, couple_id: str, key: str, value: str):
-        await asyncio.to_thread(
-            self._exec,
-            "INSERT OR REPLACE INTO couple_memory (couple_id, key, value) VALUES (?, ?, ?)",
-            (couple_id, key, value),
-        )
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO couple_memory (couple_id, key, value) VALUES ($1, $2, $3)
+                ON CONFLICT (couple_id, key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                couple_id, key, value,
+            )
 
     async def get_couple_memory(self, couple_id: str) -> dict:
-        rows = await asyncio.to_thread(
-            self._fetchall, "SELECT key, value FROM couple_memory WHERE couple_id=?", (couple_id,)
-        )
-        return {r["key"]: r["value"] for r in rows}
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, value FROM couple_memory WHERE couple_id=$1", couple_id)
+            return {r["key"]: r["value"] for r in rows}
 
     # ---------- yordamchi metodlar ----------
-
-    def _exec(self, query, params):
-        with self._connect() as conn:
-            conn.execute(query, params)
-
-    def _exec_many(self, query, params_list):
-        with self._connect() as conn:
-            for params in params_list:
-                conn.execute(query, params)
-
-    def _fetchone(self, query, params):
-        with self._connect() as conn:
-            return conn.execute(query, params).fetchone()
-
-    def _fetchall(self, query, params):
-        with self._connect() as conn:
-            return conn.execute(query, params).fetchall()
 
     @staticmethod
     def _row_to_record(row) -> UserRecord:
