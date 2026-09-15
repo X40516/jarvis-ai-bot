@@ -35,11 +35,6 @@ CREATE TABLE IF NOT EXISTS couple_memory (
     PRIMARY KEY (couple_id, key)
 );
 
-CREATE TABLE IF NOT EXISTS pending_pairs (
-    code TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    created_at REAL NOT NULL
-);
 """
 
 
@@ -117,6 +112,15 @@ class Database:
         row = await asyncio.to_thread(self._fetchone, "SELECT * FROM users WHERE user_id=?", (user_id,))
         return self._row_to_record(row) if row else None
 
+    async def get_user_by_username(self, username: str) -> Optional[UserRecord]:
+        """Telegram username orqali foydalanuvchini topadi (faqat botga avval /start
+        bosgan foydalanuvchilar topiladi — Telegram Bot API boshqacha yo'l bermaydi)."""
+        username = username.lstrip("@").lower()
+        row = await asyncio.to_thread(
+            self._fetchone, "SELECT * FROM users WHERE lower(username)=?", (username,)
+        )
+        return self._row_to_record(row) if row else None
+
     # ---------- Qoidabuzarlik / bloklash ----------
 
     async def register_violation(self, user_id: int) -> int:
@@ -139,23 +143,6 @@ class Database:
         return await asyncio.to_thread(_run)
 
     # ---------- Couple pairing & memory ----------
-
-    async def create_pending_pair(self, code: str, user_id: int):
-        await asyncio.to_thread(
-            self._exec,
-            "INSERT OR REPLACE INTO pending_pairs (code, user_id, created_at) VALUES (?, ?, ?)",
-            (code, user_id, time.time()),
-        )
-
-    async def consume_pending_pair(self, code: str) -> Optional[int]:
-        def _run():
-            with self._connect() as conn:
-                row = conn.execute("SELECT user_id FROM pending_pairs WHERE code=?", (code,)).fetchone()
-                if row is None:
-                    return None
-                conn.execute("DELETE FROM pending_pairs WHERE code=?", (code,))
-                return row["user_id"]
-        return await asyncio.to_thread(_run)
 
     async def link_couple(self, user_a: int, user_b: int) -> str:
         couple_id = f"{min(user_a, user_b)}_{max(user_a, user_b)}"
